@@ -8,7 +8,7 @@ import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { EffectComposer, Bloom } from '@react-three/postprocessing';
 import * as THREE from 'three';
 import { Search, Map as MapIcon, Loader2 } from 'lucide-react';
-import { MapControls, Text } from '@react-three/drei';
+import { OrbitControls, Text } from '@react-three/drei';
 import { FontLoader } from 'three/examples/jsm/loaders/FontLoader.js';
 
 const CITIES = [
@@ -826,16 +826,17 @@ function CityMap({ data, cityName, onComplete, onAgentComplete, isComplete, forc
   const railwayPositions = useMemo(() => buildLineSegments(data.railways), [data.railways]);
   const boundaryPositions = useMemo(() => buildLineSegments(data.boundaries), [data.boundaries]);
 
-  // Center camera on load or when forceFit changes
+  // Center camera only when user explicitly requests re-center (forceFit > 0)
   useEffect(() => {
-    camera.position.set(0, 0, 12);
+    if (forceFit === 0) return;
+    camera.position.set(0, 0, 17);
     camera.lookAt(0, 0, 0);
     if (controls) {
-      const mapControls = controls as any;
-      mapControls.target.set(0, 0, 0);
-      mapControls.update();
+      const c = controls as any;
+      c.target.set(0, 0, 0);
+      c.update();
     }
-  }, [data, forceFit, camera, controls]);
+  }, [forceFit, camera, controls]);
 
   const headsRef = useRef<Map<string, THREE.Vector3>>(new Map());
   const onUpdateHead = useCallback((id: string, pos: THREE.Vector3 | null) => {
@@ -917,6 +918,196 @@ function CityMap({ data, cityName, onComplete, onAgentComplete, isComplete, forc
   );
 }
 
+// ── Sci-fi stamp border rendered in 3D scene ────────────────────────────────────
+function StampFrame() {
+  const W = 11.5;
+  const H = 11.5;
+
+  // Dashed segments along edges (skip corner bracket area)
+  const outerDashes = useMemo(() => {
+    const pts: number[] = [];
+    const dash = 0.28, gap = 0.20, period = dash + gap, z = 0.2, reserve = 2.5;
+    function addEdge(x0: number, y0: number, x1: number, y1: number) {
+      const len = Math.sqrt((x1-x0)**2 + (y1-y0)**2);
+      const ux = (x1-x0)/len, uy = (y1-y0)/len;
+      let d = reserve;
+      const maxD = len - reserve;
+      while (d + dash <= maxD) {
+        pts.push(x0+ux*d, y0+uy*d, z,  x0+ux*(d+dash), y0+uy*(d+dash), z);
+        d += period;
+      }
+    }
+    addEdge(-W, H, W, H);   addEdge(W, H, W, -H);
+    addEdge(W, -H, -W, -H); addEdge(-W, -H, -W, H);
+    return new Float32Array(pts);
+  }, []);
+
+  // Subtle inner border
+  const innerBorder = useMemo(() => {
+    const iW = W - 0.6, iH = H - 0.6, z = 0.15;
+    return new Float32Array([
+      -iW, iH, z,  iW, iH, z,   iW, iH, z,  iW,-iH, z,
+       iW,-iH, z, -iW,-iH, z,  -iW,-iH, z, -iW, iH, z,
+    ]);
+  }, []);
+
+  // Corner L-brackets with caps and inset detail
+  const cornerBrackets = useMemo(() => {
+    const pts: number[] = [];
+    const arm = 2.4, z = 0.3;
+    const corners: [number,number,number,number][] = [
+      [-W, H, 1,-1], [W, H,-1,-1], [-W,-H, 1, 1], [W,-H,-1, 1],
+    ];
+    corners.forEach(([cx, cy, dx, dy]) => {
+      // Main L arms
+      pts.push(cx, cy, z,  cx+dx*arm, cy, z);
+      pts.push(cx, cy, z,  cx, cy+dy*arm, z);
+      // End caps
+      pts.push(cx+dx*arm, cy-0.2, z,  cx+dx*arm, cy+0.2, z);
+      pts.push(cx-0.2, cy+dy*arm, z,  cx+0.2, cy+dy*arm, z);
+      // Corner inset square
+      const s = 0.5;
+      pts.push(cx+dx*s, cy, z,  cx+dx*s, cy+dy*s, z);
+      pts.push(cx, cy+dy*s, z,  cx+dx*s, cy+dy*s, z);
+      // Inner arm detail lines
+      pts.push(cx+dx*(arm-0.55), cy+dy*0.38, z, cx+dx*arm, cy+dy*0.38, z);
+      pts.push(cx+dx*0.38, cy+dy*(arm-0.55), z, cx+dx*0.38, cy+dy*arm, z);
+    });
+    return new Float32Array(pts);
+  }, []);
+
+  // Tick marks along edges
+  const edgeTicks = useMemo(() => {
+    const pts: number[] = [], z = 0.2, step = 1.15;
+    for (let x = -W + step; x < W - 0.1; x += step) {
+      pts.push(x, H, z, x, H+0.2, z);
+      pts.push(x,-H, z, x,-H-0.2, z);
+    }
+    for (let y = -H + step; y < H - 0.1; y += step) {
+      pts.push(-W, y, z, -W-0.2, y, z);
+      pts.push( W, y, z,  W+0.2, y, z);
+    }
+    return new Float32Array(pts);
+  }, []);
+
+  // Animated scan sweep
+  const TRAIL = 38;
+  const scanBuf = useMemo(() => new Float32Array(TRAIL * 6), []);
+  const scanGeoRef = useRef<THREE.BufferGeometry>(null);
+  const scanMatRef = useRef<THREE.LineBasicMaterial>(null);
+
+  const perimPts = useMemo(() => {
+    const N = 320, n4 = Math.floor(N/4), pts: [number,number][] = [];
+    for (let i = 0; i < n4; i++) pts.push([-W+(i/n4)*2*W, H]);
+    for (let i = 0; i < n4; i++) pts.push([W, H-(i/n4)*2*H]);
+    for (let i = 0; i < n4; i++) pts.push([W-(i/n4)*2*W, -H]);
+    for (let i = 0; i < n4; i++) pts.push([-W, -H+(i/n4)*2*H]);
+    return pts;
+  }, []);
+
+  useFrame((state) => {
+    if (!scanGeoRef.current || !scanMatRef.current) return;
+    const t = (state.clock.elapsedTime * 0.08) % 1.0;
+    const N = perimPts.length, head = Math.floor(t * N);
+    let vi = 0;
+    for (let i = 0; i < TRAIL; i++) {
+      const a = (head-i+N)%N, b = (head-i-1+N)%N;
+      scanBuf[vi++]=perimPts[a][0]; scanBuf[vi++]=perimPts[a][1]; scanBuf[vi++]=0.4;
+      scanBuf[vi++]=perimPts[b][0]; scanBuf[vi++]=perimPts[b][1]; scanBuf[vi++]=0.4;
+    }
+    scanGeoRef.current.setAttribute('position', new THREE.BufferAttribute(scanBuf, 3));
+    scanGeoRef.current.setDrawRange(0, TRAIL * 2);
+    scanMatRef.current.opacity = 0.65 + Math.sin(state.clock.elapsedTime * 22) * 0.25;
+  });
+
+  return (
+    <group>
+      {/* Dashed outer edges */}
+      <lineSegments>
+        <bufferGeometry>
+          <bufferAttribute attach="attributes-position" count={outerDashes.length/3} array={outerDashes} itemSize={3} />
+        </bufferGeometry>
+        <lineBasicMaterial color="#ff6600" transparent opacity={0.65} blending={THREE.AdditiveBlending} />
+      </lineSegments>
+      {/* Inner border */}
+      <lineSegments>
+        <bufferGeometry>
+          <bufferAttribute attach="attributes-position" count={innerBorder.length/3} array={innerBorder} itemSize={3} />
+        </bufferGeometry>
+        <lineBasicMaterial color="#ff4400" transparent opacity={0.25} />
+      </lineSegments>
+      {/* Corner brackets */}
+      <lineSegments>
+        <bufferGeometry>
+          <bufferAttribute attach="attributes-position" count={cornerBrackets.length/3} array={cornerBrackets} itemSize={3} />
+        </bufferGeometry>
+        <lineBasicMaterial color="#ff8800" transparent opacity={0.95} blending={THREE.AdditiveBlending} />
+      </lineSegments>
+      {/* Edge ticks */}
+      <lineSegments>
+        <bufferGeometry>
+          <bufferAttribute attach="attributes-position" count={edgeTicks.length/3} array={edgeTicks} itemSize={3} />
+        </bufferGeometry>
+        <lineBasicMaterial color="#ff5500" transparent opacity={0.45} blending={THREE.AdditiveBlending} />
+      </lineSegments>
+      {/* Animated scan */}
+      <lineSegments>
+        <bufferGeometry ref={scanGeoRef} />
+        <lineBasicMaterial ref={scanMatRef} color="#ffcc00" transparent opacity={0.8} blending={THREE.AdditiveBlending} />
+      </lineSegments>
+    </group>
+  );
+}
+
+// ── Download capture helper ──────────────────────────────────────────────────
+function DownloadHelper({ cityName, downloadRef }: { cityName: string, downloadRef: React.MutableRefObject<() => void> }) {
+  const { gl, camera } = useThree();
+  useEffect(() => {
+    downloadRef.current = () => {
+      const savedPos = camera.position.clone();
+      const savedQuat = camera.quaternion.clone();
+      const cam = camera as THREE.PerspectiveCamera;
+      const savedAspect = cam.aspect;
+
+      // Snap to square front-facing view so full stamp is framed
+      cam.aspect = 1.0;
+      cam.updateProjectionMatrix();
+      camera.position.set(0, 0, 28);
+      camera.lookAt(0, 0, 0);
+
+      // Temporarily resize canvas to square so download image is square
+      const container = gl.domElement.parentElement;
+      const prevW = gl.domElement.width;
+      const prevH = gl.domElement.height;
+      const size = Math.min(prevW, prevH, 1600);
+      gl.setSize(size, size, false);
+
+      // Two rAFs: first lets R3F pick up state changes, second fires after
+      // EffectComposer renders the new frame into the buffer
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          const url = gl.domElement.toDataURL('image/png');
+
+          // Restore renderer, camera
+          gl.setSize(prevW, prevH, false);
+          camera.position.copy(savedPos);
+          camera.quaternion.copy(savedQuat);
+          cam.aspect = savedAspect;
+          cam.updateProjectionMatrix();
+
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `neural-cartography-${cityName.toLowerCase().replace(/\s+/g, '-')}.png`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+        });
+      });
+    };
+  }, [gl, camera, cityName, downloadRef]);
+  return null;
+}
+
 type AgentStatus = 'idle' | 'working' | 'done';
 
 const AGENTS = [
@@ -938,6 +1129,11 @@ export default function App() {
   const [forceFit, setForceFit] = useState(0);
   const [agentStatuses, setAgentStatuses] = useState<Record<string, AgentStatus>>({});
   const [searchId, setSearchId] = useState(0);
+  const downloadRef = useRef<() => void>(() => {});
+  const currentCityName = useMemo(
+    () => GROUPED_CITIES.flatMap(g => g[1]).find(c => c.index === cityIndex)?.name || 'city',
+    [cityIndex]
+  );
 
   const handleSearch = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -969,111 +1165,33 @@ export default function App() {
   }, []);
 
   return (
-    <div className="w-full h-screen bg-[#050505] text-white font-mono overflow-hidden relative">
-      <div className="absolute top-0 left-0 p-6 z-10 flex flex-col items-start pointer-events-none">
-        <h1 className="text-2xl tracking-[0.3em] uppercase font-light mb-2 flex items-center gap-3 text-white">
-          <MapIcon className="w-6 h-6 text-orange-500" />
-          Neural Cartography
-        </h1>
-        <p className="text-xs text-white/50 tracking-widest uppercase">
-          Distributed Agent Mapping Protocol
-        </p>
-      </div>
+    <div className="w-full h-screen bg-[#050303] font-mono overflow-hidden relative">
 
-      <div className="absolute top-24 left-6 z-10 flex flex-col gap-3 pointer-events-none">
-        {AGENTS.map(agent => {
-          const status = agentStatuses[agent.id] || 'idle';
-          return (
-            <div key={agent.id} className="flex items-center gap-3 text-[10px] tracking-widest">
-              <div className={`w-1.5 h-1.5 rounded-full ${
-                status === 'working' ? 'bg-orange-500 animate-pulse' : 
-                status === 'done' ? 'bg-orange-700' : 
-                'bg-neutral-800'
-              }`} />
-              <span className={
-                status === 'working' ? 'text-white' : 
-                status === 'done' ? 'text-white/50' : 
-                'text-neutral-700'
-              }>
-                {agent.label} ... {status.toUpperCase()}
-              </span>
-            </div>
-          );
-        })}
-      </div>
-
-      {isDrawingComplete && (
-        <button 
-          onClick={() => setForceFit(f => f + 1)}
-          className="absolute bottom-10 left-1/2 -translate-x-1/2 z-10 bg-orange-500/10 border border-orange-500/20 text-white px-4 py-2 text-xs tracking-widest hover:bg-orange-500/20 transition-colors backdrop-blur-md pointer-events-auto"
-        >
-          RE-CENTER MAP
-        </button>
-      )}
-
-      <div className="absolute top-6 right-6 z-10 w-full max-w-xs flex flex-col gap-4">
-        <div className="relative flex items-center">
-          <div className="absolute left-4 text-neutral-500 pointer-events-none">
-            {loading ? <Loader2 className="w-5 h-5 animate-spin text-orange-500" /> : <Search className="w-5 h-5" />}
-          </div>
-          <select
-            value={cityIndex}
-            onChange={(e) => setCityIndex(Number(e.target.value))}
-            disabled={loading}
-            className="w-full bg-black/50 border border-orange-500/20 focus:border-orange-500/50 rounded-none py-4 pl-12 pr-10 text-sm tracking-widest outline-none transition-colors backdrop-blur-sm text-orange-400 appearance-none cursor-pointer disabled:opacity-50"
-          >
-            {GROUPED_CITIES.map(([country, cities]) => (
-              <optgroup key={country} label={country.toUpperCase()} className="bg-black text-orange-500/50 font-bold">
-                {cities.map(({ name, index }) => (
-                  <option key={index} value={index} className="bg-[#111] text-orange-400 font-normal">
-                    {name.toUpperCase()}
-                  </option>
-                ))}
-              </optgroup>
-            ))}
-          </select>
-          <div className="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-neutral-500">
-            ▼
-          </div>
-        </div>
-        
-        <button
-          onClick={handleSearch}
-          disabled={loading}
-          className="w-full py-4 bg-orange-500/10 border border-orange-500/50 text-white tracking-[0.3em] uppercase hover:bg-orange-500/20 transition-colors disabled:opacity-50"
-        >
-          {loading ? 'INITIATING...' : 'INITIATE PROTOCOL'}
-        </button>
-
-        {error && (
-          <div className="text-red-500 text-xs tracking-widest text-center bg-red-500/10 py-2 border border-red-500/20">
-            ERROR: {error}
-          </div>
-        )}
-      </div>
-
-      <div className="absolute bottom-6 right-6 z-10 text-xs text-white/50 tracking-widest uppercase pointer-events-none">
-        Concept by Shahnab
-      </div>
-
-      <Canvas camera={{ position: [0, 0, 12], fov: 50 }}>
-        <color attach="background" args={['#020202']} />
+      {/* ── Full-screen canvas ── */}
+      <Canvas
+        camera={{ position: [0, 0, 28], fov: 50 }}
+        gl={{ preserveDrawingBuffer: true }}
+        style={{ position: 'absolute', inset: 0 }}
+      >
+        <color attach="background" args={['#020101']} />
         <ambientLight intensity={0.5} />
-        <MapControls 
-          makeDefault 
-          enableDamping 
-          dampingFactor={0.05} 
-          maxDistance={50} 
-          minDistance={2} 
-          enableRotate={false}
+        <OrbitControls
+          makeDefault
+          enableDamping
+          dampingFactor={0.06}
+          maxDistance={60}
+          minDistance={4}
+          maxPolarAngle={Math.PI / 2.2}
           screenSpacePanning={true}
         />
+        <StampFrame />
+        <DownloadHelper cityName={currentCityName} downloadRef={downloadRef} />
         {cityData && (
-          <CityMap 
+          <CityMap
             key={`${searchId}`}
-            data={cityData} 
+            data={cityData}
             cityName={GROUPED_CITIES.flatMap(g => g[1]).find(c => c.index === cityIndex)?.name || ''}
-            onComplete={() => setIsDrawingComplete(true)} 
+            onComplete={() => setIsDrawingComplete(true)}
             onAgentComplete={handleAgentComplete}
             isComplete={isDrawingComplete}
             forceFit={forceFit}
@@ -1083,6 +1201,108 @@ export default function App() {
           <Bloom luminanceThreshold={0.5} luminanceSmoothing={0.9} intensity={0.6} />
         </EffectComposer>
       </Canvas>
+
+      {/* ── Top-left: title ── */}
+      <div className="absolute top-0 left-0 p-5 z-10 pointer-events-none select-none">
+        <div className="flex items-center gap-2.5 mb-1">
+          <MapIcon className="w-4 h-4 text-orange-500 shrink-0" />
+          <span className="text-[11px] tracking-[0.45em] uppercase text-white/80">Neural Cartography</span>
+        </div>
+        <p className="text-[8px] text-orange-500/35 tracking-[0.3em] uppercase pl-[26px]">
+          Distributed Agent Mapping Protocol
+        </p>
+      </div>
+
+      {/* ── Top-right: city selector + initiate ── */}
+      <div className="absolute top-0 right-0 p-5 z-10 flex flex-col gap-2 w-60">
+        <div className="relative flex items-center">
+          <div className="absolute left-3 pointer-events-none">
+            {loading
+              ? <Loader2 className="w-3.5 h-3.5 animate-spin text-orange-500" />
+              : <Search className="w-3.5 h-3.5 text-orange-500/40" />}
+          </div>
+          <select
+            value={cityIndex}
+            onChange={(e) => setCityIndex(Number(e.target.value))}
+            disabled={loading}
+            className="w-full bg-black/40 border-b border-orange-500/25 py-2.5 pl-9 pr-7 text-[11px] tracking-[0.2em] outline-none text-orange-400 appearance-none cursor-pointer disabled:opacity-40 transition-colors focus:border-orange-500/60"
+          >
+            {GROUPED_CITIES.map(([country, cities]) => (
+              <optgroup key={country} label={country.toUpperCase()} className="bg-black text-orange-500/50">
+                {cities.map(({ name, index }) => (
+                  <option key={index} value={index} className="bg-[#0a0705] text-orange-400">
+                    {name.toUpperCase()}
+                  </option>
+                ))}
+              </optgroup>
+            ))}
+          </select>
+          <div className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-orange-500/40 text-[9px]">▼</div>
+        </div>
+
+        <button
+          onClick={handleSearch}
+          disabled={loading}
+          className="w-full py-2.5 border border-orange-500/40 text-orange-400 text-[10px] tracking-[0.35em] uppercase hover:border-orange-500/70 hover:text-orange-300 transition-colors disabled:opacity-40"
+        >
+          {loading ? 'INITIATING...' : 'INITIATE PROTOCOL'}
+        </button>
+
+        {error && (
+          <p className="text-red-500/80 text-[9px] tracking-widest text-center py-1 border border-red-500/20">
+            {error}
+          </p>
+        )}
+      </div>
+
+      {/* ── Bottom-left: agent status dots ── */}
+      <div className="absolute bottom-5 left-5 z-10 pointer-events-none select-none flex flex-col gap-[5px]">
+        {AGENTS.map(agent => {
+          const status = agentStatuses[agent.id] || 'idle';
+          return (
+            <div key={agent.id} className="flex items-center gap-2">
+              <div className={`w-1 h-1 rounded-full shrink-0 ${
+                status === 'working' ? 'bg-orange-500 animate-pulse' :
+                status === 'done'    ? 'bg-orange-600/60' :
+                                      'bg-white/10'
+              }`} />
+              <span className={`text-[9px] tracking-widest ${
+                status === 'working' ? 'text-orange-400' :
+                status === 'done'    ? 'text-white/25' :
+                                      'text-white/10'
+              }`}>
+                {agent.label}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* ── Bottom-center: re-center / download ── */}
+      <div className="absolute bottom-5 left-1/2 -translate-x-1/2 z-10 flex gap-3">
+        {isDrawingComplete && (
+          <>
+            <button
+              onClick={() => setForceFit(f => f + 1)}
+              className="px-4 py-2 border border-white/10 text-white/40 text-[9px] tracking-[0.3em] uppercase hover:border-white/25 hover:text-white/60 transition-colors"
+            >
+              RE-CENTER
+            </button>
+            <button
+              onClick={() => downloadRef.current()}
+              className="px-4 py-2 border border-orange-500/30 text-orange-500/70 text-[9px] tracking-[0.3em] uppercase hover:border-orange-500/60 hover:text-orange-400 transition-colors"
+            >
+              ↓ DOWNLOAD
+            </button>
+          </>
+        )}
+      </div>
+
+      {/* ── Bottom-right: attribution ── */}
+      <div className="absolute bottom-5 right-5 z-10 text-[8px] text-white/20 tracking-[0.35em] uppercase pointer-events-none select-none">
+        Concept by Shahnab
+      </div>
+
     </div>
   );
 }
